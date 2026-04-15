@@ -622,19 +622,12 @@ class DSAAttention(nn.Module):
             # For decode (with cache): need cos/sin for all cached positions
             # to invert RoPE on the cached keys.
             if past_key_values is not None and seq_k > seq_q:
-                # Decode path: build full cos/sin tables for all cached
-                # positions.  The model's rotary embedder produces tables
-                # for arbitrary position ranges.
-                backbone = getattr(
-                    self, "_backbone_ref", None
-                )
-                # Use the scorer's cache-aware method
+                # Decode path: the scorer generates its own cos/sin tables
+                # for the full seq_k range via its internal rotary embedder.
                 topk_flat = self.tri_scorer.score_tokens_with_cache(
                     layer_idx=self.layer_idx,
                     cached_key_states=key_states,
                     k_rot_raw_current=k_rot_raw,
-                    cos_full=cos,
-                    sin_full=sin,
                     cache_position=cache_position,
                     seq_q=seq_q,
                     topk=self.dsa_config.index_topk,
