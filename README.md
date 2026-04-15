@@ -85,6 +85,8 @@ python tests/test_tri_scorer.py --device mps  # if using M-Series Mac
 python tests/sanity_sparse_vs_dense.py --device mps --seq-len 1024 --topk 64
 python tests/sparsity_sweep.py --device mps --seq-lens 1024 2048 \
     --topks 16 32 64 128 256 512
+python tests/perplexity_sweep.py --device mps --seq-len 1024 --num-chunks 32 \
+    --topks 32 64 128 256 512
 ```
 
 `check.py` verifies that the converter preserves MLA weights, that Indexer shapes are correct, and that the Indexer mask actually affects the output when `topk=1`. `test_tri_scorer.py` builds the scorer, attaches it to every layer, and runs a forward pass against the Indexer baseline. `sanity_sparse_vs_dense.py` compares the tri-scorer, a uniform-random selector, and dense attention on a long prompt. `sparsity_sweep.py` runs the same comparison across a grid of `(seq_len, topk)` values and writes a CSV.
@@ -117,8 +119,28 @@ python tests/sparsity_sweep.py --device mps --seq-lens 1024 2048 \
 
 The tri-scorer beats uniform-random on next-token top-1 agreement in every cell, with gaps of +6 to +33 percentage points. Top-1 agreement saturates around 25-50% of context retained (`topk / seq_len`). At extreme sparsity (≤ 6% of context) all selectors lose substantial fidelity to dense, but tri-scorer remains roughly 2-3x better than random.
 
-MSE numbers are noisier on a single prompt (random selection has high variance per draw) — top-1 agreement is the more reliable metric. A multi-prompt perplexity sweep is the natural next step.
+MSE numbers are noisier on a single prompt (random selection has high variance per draw) — top-1 agreement is the more reliable metric.
+
+### Perplexity sweep on wikitext-2 test (32 chunks of 1024 tokens)
+
+| Mode | topk | NLL | PPL | vs dense |
+|---|---:|---:|---:|---:|
+| dense | 1024 | 1.47 | 4.36 | 1.00x |
+| tri | 512 | 4.53 | 92.59 | 21x |
+| random | 512 | 5.04 | 154.54 | 35x |
+| tri | 256 | 6.28 | 535.09 | 123x |
+| random | 256 | 6.36 | 578.78 | 133x |
+| tri | 128 | 6.95 | 1,046.91 | 240x |
+| random | 128 | 7.14 | 1,264.71 | 290x |
+| tri | 64 | 7.55 | 1,894.51 | 435x |
+| random | 64 | 7.63 | 2,064.15 | 474x |
+| tri | 32 | 8.16 | 3,512.77 | 806x |
+| random | 32 | 8.11 | 3,311.89 | 760x |
+
+The tri-scorer beats uniform random at every `topk >= 64`, with the largest absolute gap at `topk = 512` (PPL 92.6 vs 154.5, a 0.60 ratio). At `topk = 32` the two are within noise of each other.
+
+But the more important observation is that **no calibration-only sparsity below 50% retention preserves model quality on this 1B MLA model**. Even with the good selector, 50% sparsity costs 21x perplexity, and 25% sparsity (`topk = 256`) blows up to 123x. The deterministic tri-scorer is a real signal — it consistently beats random — but it is not by itself sufficient to make sparse attention drop-in here. Training the Indexer (the standard DSA recipe) is likely required to recover dense quality at meaningful sparsity ratios.
 
 ## Status
 
-End-to-end plumbing is verified, and the scorer cleanly beats a random-selection baseline across all tested sparsity levels and at both 1k and 2k context. Remaining work: perplexity harness on wikitext-2 held-out (many prompts, lower variance), longer-context runs (4k+), and batch-size-greater-than-one support in the decode path.
+End-to-end plumbing is verified, and the calibration-based scorer cleanly beats a random-selection baseline across all tested sparsity levels. The tri-scorer alone does not yet recover dense-quality outputs at meaningful sparsity (below roughly 50% retained context). Natural next directions: long-context runs (4k+) where sparse attention's benefit is larger, training the Indexer (DSA's original recipe, with tri-scorer as a strong initialization or distillation target), and exploring per-layer hybrids (dense in early layers, sparse in later ones).
