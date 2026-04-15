@@ -333,21 +333,22 @@ class TriAttentionScorer:
         rope_scaling.pop("type", None)
         config.rope_scaling = rope_scaling
 
-        rotary = LlamaRotaryEmbedding(config=config, device=cpu)
-        rotary.to(dtype=dtype, device=cpu)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config, device=cpu)
+        self.rotary_emb.to(dtype=dtype, device=cpu)
+        self._rotary_dtype = dtype
 
         self.attention_scale: float = float(
-            getattr(rotary, "attention_scaling", 1.0)
+            getattr(self.rotary_emb, "attention_scaling", 1.0)
         )
 
         # --- omega from inv_freq ---
-        inv_freq = rotary.inv_freq.to(device=cpu, dtype=torch.float32)
+        inv_freq = self.rotary_emb.inv_freq.to(device=cpu, dtype=torch.float32)
         freq_count = max(1, self.head_dim // 2)
         self.omega = inv_freq[:freq_count]
 
         # --- freq_scale_sq from a single rotary probe ---
         freq_scale = _compute_frequency_scaling(
-            rotary, self.head_dim, dtype, cpu,
+            self.rotary_emb, self.head_dim, dtype, cpu,
         )
         self.freq_scale_sq = freq_scale.pow(2)
 
@@ -378,6 +379,7 @@ class TriAttentionScorer:
         self.omega = self.omega.to(device_obj)
         self.freq_scale_sq = self.freq_scale_sq.to(device_obj)
         self.offsets = self.offsets.to(device_obj)
+        self.rotary_emb.to(device_obj)
 
         for key, stats in self.head_stats.items():
             self.head_stats[key] = HeadFrequencyStats(
@@ -460,8 +462,6 @@ class TriAttentionScorer:
         layer_idx: int,
         cached_key_states: torch.Tensor,
         k_rot_raw_current: torch.Tensor,
-        cos_full: torch.Tensor,
-        sin_full: torch.Tensor,
         cache_position: Optional[torch.LongTensor],
         seq_q: int,
         topk: int,
@@ -470,7 +470,9 @@ class TriAttentionScorer:
         Score all key positions (cached + current) and return top-k indices.
 
         Handles the decode path where past keys are post-RoPE in the cache
-        and current keys are available pre-RoPE.
+        and current keys are available pre-RoPE.  The scorer generates
+        cos/sin tables for the full seq_k range internally using its own
+        rotary embedder — the caller does not need to pass them in.
 
         Args:
             layer_idx           : Transformer layer index
@@ -478,10 +480,6 @@ class TriAttentionScorer:
                                   from cache (post-RoPE for the rope portion)
             k_rot_raw_current   : [bsz, 1, seq_q, rope_head_dim] pre-RoPE keys
                                   for current positions
-            cos_full            : [bsz, seq_k, rope_head_dim] cos table for ALL
-                                  positions in the cache
-            sin_full            : [bsz, seq_k, rope_head_dim] sin table for ALL
-                                  positions in the cache
             cache_position      : [seq_q] absolute positions of current tokens
             seq_q               : Number of current query positions
             topk                : Number of top positions to return
@@ -490,27 +488,21 @@ class TriAttentionScorer:
             topk_indices : [topk] indices into seq_k
         """
         seq_k = cached_key_states.shape[2]
-        qk_head_dim = cached_key_states.shape[3]
         rope_dim = self.head_dim  # qk_rope_head_dim = 64
 
         # --- Determine absolute positions for all seq_k tokens ---
+        # Assumes the cache was filled contiguously from position 0, with
+        # the current tokens at the tail.  cache_position (if present)
+        # gives the authoritative positions for the current seq_q tokens.
         if cache_position is not None:
-            # cache_position gives positions for current tokens;
-            # earlier cached positions are 0..seq_k-seq_q-1
-            current_pos = cache_position[-1].item()
-            all_positions = torch.arange(
-                seq_k, device=self.device, dtype=torch.long,
-            )
+            current_pos = int(cache_position[-1].item())
         else:
             current_pos = seq_k - 1
-            all_positions = torch.arange(
-                seq_k, device=self.device, dtype=torch.long,
-            )
+        all_positions = torch.arange(
+            seq_k, device=self.device, dtype=torch.long,
+        )
 
         # --- Recover pre-RoPE keys for ALL positions ---
-        # Extract the RoPE portion from cached keys (last rope_dim dims)
-        # cached_key_states: [bsz, n_heads, seq_k, qk_head_dim]
-        # The rope portion is the last rope_dim dimensions
         k_rot_cached = cached_key_states[0, 0, :, -rope_dim:]  # [seq_k, rope_dim]
 
         # For past positions (0..seq_k-seq_q-1): invert RoPE
@@ -518,10 +510,23 @@ class TriAttentionScorer:
         num_past = seq_k - seq_q
 
         if num_past > 0:
-            # Invert RoPE on past cached keys
-            # cos_full/sin_full: [bsz, seq_k, rope_dim] — need [num_past, rope_dim]
-            cos_past = cos_full[0, :num_past, :]  # [num_past, rope_dim]
-            sin_past = sin_full[0, :num_past, :]
+            # Generate cos/sin for all past positions via the scorer's own
+            # rotary embedder.  The embedder produces tables for whatever
+            # position_ids we ask for — no need to inherit them from the
+            # caller.
+            past_position_ids = torch.arange(
+                num_past, device=self.device, dtype=torch.long,
+            ).unsqueeze(0)  # [1, num_past]
+            probe = torch.zeros(
+                1, num_past, rope_dim,
+                device=self.device, dtype=self._rotary_dtype,
+            )
+            cos_past_full, sin_past_full = self.rotary_emb(
+                probe, past_position_ids,
+            )
+            # cos_past_full, sin_past_full: [1, num_past, rope_dim]
+            cos_past = cos_past_full[0].to(dtype=k_rot_cached.dtype)
+            sin_past = sin_past_full[0].to(dtype=k_rot_cached.dtype)
             k_rot_past = k_rot_cached[:num_past]  # [num_past, rope_dim]
             k_unrot_past = _invert_rope(
                 k_rot_past, cos_past, sin_past,
