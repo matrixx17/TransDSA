@@ -19,9 +19,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from transformers import AutoConfig
+
+try:
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+except ImportError:
+    LlamaRotaryEmbedding = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -232,127 +238,164 @@ class TriAttentionScorer:
     vectors.  No learned parameters — all scoring is deterministic from
     the calibration file.
 
-    Usage from DSAAttention:
-        scorer = TriAttentionScorer.from_stats(stats_path, model, device)
-        topk = scorer.score_tokens(layer_idx, k_rot_raw, positions, topk)
+    Usage:
+        scorer = TriAttentionScorer(
+            stats_path="./outputs/llama3.2-1b-dsa-stats.pt",
+            model_path="./outputs/llama3.2-1b-dsa",
+        )
+        scorer.to("mps")   # optional: move tensors to a device
+        topk = scorer.score_tokens(layer_idx, k_rot_raw, positions, pos, topk)
     """
 
     def __init__(
         self,
-        head_stats: Dict[Tuple[int, int], HeadFrequencyStats],
-        sampled_heads: List[Tuple[int, int]],
-        omega: torch.Tensor,
-        freq_scale_sq: torch.Tensor,
-        offsets: torch.Tensor,
-        attention_scale: float,
-        head_dim: int,
-        device: torch.device,
-        aggregation: str = "mean",
-    ) -> None:
-        self.head_stats = head_stats
-        self.sampled_heads = sampled_heads
-        self.omega = omega
-        self.freq_scale_sq = freq_scale_sq
-        self.offsets = offsets
-        self.attention_scale = attention_scale
-        self.head_dim = head_dim
-        self.device = device
-        self.aggregation = aggregation
-
-        # Pre-index heads by layer for fast lookup
-        self._heads_by_layer: Dict[int, List[Tuple[int, HeadFrequencyStats]]] = {}
-        for layer_idx, head_idx in sampled_heads:
-            key = (layer_idx, head_idx)
-            if key in head_stats:
-                self._heads_by_layer.setdefault(layer_idx, []).append(
-                    (head_idx, head_stats[key])
-                )
-
-    @classmethod
-    def from_stats(
-        cls,
-        stats_path: str,
-        model: torch.nn.Module,
-        device: torch.device,
-        dtype: torch.dtype = torch.bfloat16,
+        stats_path: Union[str, Path],
+        model_path: Union[str, Path],
+        *,
+        dtype: torch.dtype = torch.float32,
         offset_max_length: int = 65536,
         aggregation: str = "mean",
-    ) -> "TriAttentionScorer":
+    ) -> None:
         """
-        Load calibration stats and build a scorer tied to the given model.
+        Build a self-contained TriAttention scorer.
 
         Args:
-            stats_path         : Path to the .pt file from calibrate.py
-            model              : The loaded HF model (needed for rotary_emb)
-            device             : Device for scorer tensors
-            dtype              : Working dtype for rotary probing
-            offset_max_length  : Max length for geometric offset grid
-            aggregation        : "mean" or "max" for offset aggregation
+            stats_path        : Path to .pt file produced by calibrate.py.
+                                Contains per-(layer, head) frequency stats
+                                (q_mean_complex, q_abs_mean) and metadata
+                                (sampled_heads, head_dim).
+            model_path        : Path or HF ID of the MLA model.  Used to
+                                read the config (rope_theta, rope_scaling,
+                                head_dim) and build a rotary embedder that
+                                matches the model exactly.
+            dtype             : Working dtype for rotary probing.
+            offset_max_length : Max length for the geometric offset grid.
+            aggregation       : "mean" or "max" for offset aggregation.
+
+        All scorer tensors start on CPU.  Call .to(device) to move them.
         """
-        payload = torch.load(stats_path, map_location=device, weights_only=False)
+        self.aggregation = aggregation
+        self.device = torch.device("cpu")
+        cpu = self.device
+
+        # --- Load stats payload ---
+        payload = torch.load(
+            str(stats_path), map_location=cpu, weights_only=False,
+        )
         metadata = payload["metadata"]
         stats_raw = payload["stats"]
 
-        # Parse sampled heads
-        sampled_heads = [
+        self.sampled_heads: List[Tuple[int, int]] = [
             (int(pair[0]), int(pair[1]))
             for pair in metadata["sampled_heads"]
         ]
+        self.head_dim: int = int(metadata["head_dim"])
 
-        # Reconstruct HeadFrequencyStats
-        head_stats: Dict[Tuple[int, int], HeadFrequencyStats] = {}
-        for layer_idx, head_idx in sampled_heads:
+        # --- Reconstruct per-head stats on CPU ---
+        self.head_stats: Dict[Tuple[int, int], HeadFrequencyStats] = {}
+        for layer_idx, head_idx in self.sampled_heads:
             key = f"layer{layer_idx:02d}_head{head_idx:02d}"
             entry = stats_raw.get(key)
             if entry is None:
                 continue
             q_mean_complex = torch.complex(
-                entry["q_mean_real"].to(device=device, dtype=torch.float32),
-                entry["q_mean_imag"].to(device=device, dtype=torch.float32),
+                entry["q_mean_real"].to(dtype=torch.float32),
+                entry["q_mean_imag"].to(dtype=torch.float32),
             )
-            q_abs_mean = entry["q_abs_mean"].to(
-                device=device, dtype=torch.float32,
-            )
-            head_stats[(layer_idx, head_idx)] = HeadFrequencyStats(
+            q_abs_mean = entry["q_abs_mean"].to(dtype=torch.float32)
+            self.head_stats[(layer_idx, head_idx)] = HeadFrequencyStats(
                 q_mean_complex=q_mean_complex,
                 q_abs_mean=q_abs_mean,
             )
 
-        # Get rotary embedder from model
-        backbone = getattr(model, "model", model)
-        if hasattr(backbone, "rotary_emb"):
-            rotary = backbone.rotary_emb
-        else:
-            rotary = backbone.layers[0].self_attn.rotary_emb
-        attention_scale = float(
+        # --- Build rotary embedder from the model's config (no weights) ---
+        if LlamaRotaryEmbedding is None:
+            raise ImportError(
+                "LlamaRotaryEmbedding is not available in this "
+                "transformers build — cannot construct TriAttentionScorer."
+            )
+
+        config = AutoConfig.from_pretrained(
+            str(model_path), trust_remote_code=True,
+        )
+
+        # Normalize rope_scaling keys to the form LlamaRotaryEmbedding
+        # expects (matches pruning_utils.build_rotary logic).
+        rope_scaling = dict(getattr(config, "rope_scaling", None) or {})
+        if (
+            "attn_factor" in rope_scaling
+            and "attention_factor" not in rope_scaling
+        ):
+            rope_scaling["attention_factor"] = rope_scaling["attn_factor"]
+        rope_scaling.pop("attn_factor", None)
+        if "rope_type" not in rope_scaling:
+            rope_scaling["rope_type"] = rope_scaling.get("type", "default")
+        rope_scaling.pop("type", None)
+        config.rope_scaling = rope_scaling
+
+        rotary = LlamaRotaryEmbedding(config=config, device=cpu)
+        rotary.to(dtype=dtype, device=cpu)
+
+        self.attention_scale: float = float(
             getattr(rotary, "attention_scaling", 1.0)
         )
 
-        head_dim = int(metadata["head_dim"])
+        # --- omega from inv_freq ---
+        inv_freq = rotary.inv_freq.to(device=cpu, dtype=torch.float32)
+        freq_count = max(1, self.head_dim // 2)
+        self.omega = inv_freq[:freq_count]
 
-        # Build omega from inv_freq
-        inv_freq = rotary.inv_freq.to(device=device, dtype=torch.float32)
-        freq_count = max(1, head_dim // 2)
-        omega = inv_freq[:freq_count]
-
-        # Build frequency scaling and offset grid
+        # --- freq_scale_sq from a single rotary probe ---
         freq_scale = _compute_frequency_scaling(
-            rotary, head_dim, dtype, device,
+            rotary, self.head_dim, dtype, cpu,
         )
-        freq_scale_sq = freq_scale.pow(2)
-        offsets = _build_geometric_offsets(offset_max_length, device)
+        self.freq_scale_sq = freq_scale.pow(2)
 
-        return cls(
-            head_stats=head_stats,
-            sampled_heads=sampled_heads,
-            omega=omega,
-            freq_scale_sq=freq_scale_sq,
-            offsets=offsets,
-            attention_scale=attention_scale,
-            head_dim=head_dim,
-            device=device,
-            aggregation=aggregation,
-        )
+        # --- geometric offsets ---
+        self.offsets = _build_geometric_offsets(offset_max_length, cpu)
+
+        # --- Pre-index heads by layer for fast lookup ---
+        self._heads_by_layer: Dict[
+            int, List[Tuple[int, HeadFrequencyStats]]
+        ] = {}
+        for layer_idx, head_idx in self.sampled_heads:
+            key = (layer_idx, head_idx)
+            if key in self.head_stats:
+                self._heads_by_layer.setdefault(layer_idx, []).append(
+                    (head_idx, self.head_stats[key])
+                )
+
+    def to(self, device: Union[str, torch.device]) -> "TriAttentionScorer":
+        """
+        Move all scorer tensors to the given device.
+
+        Returns self for chaining, mirroring nn.Module.to() convention.
+        """
+        device_obj = torch.device(device)
+        if device_obj == self.device:
+            return self
+
+        self.omega = self.omega.to(device_obj)
+        self.freq_scale_sq = self.freq_scale_sq.to(device_obj)
+        self.offsets = self.offsets.to(device_obj)
+
+        for key, stats in self.head_stats.items():
+            self.head_stats[key] = HeadFrequencyStats(
+                q_mean_complex=stats.q_mean_complex.to(device_obj),
+                q_abs_mean=stats.q_abs_mean.to(device_obj),
+            )
+
+        # Rebuild the layer index with the moved stats
+        self._heads_by_layer = {}
+        for layer_idx, head_idx in self.sampled_heads:
+            key = (layer_idx, head_idx)
+            if key in self.head_stats:
+                self._heads_by_layer.setdefault(layer_idx, []).append(
+                    (head_idx, self.head_stats[key])
+                )
+
+        self.device = device_obj
+        return self
 
     def score_tokens(
         self,
