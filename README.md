@@ -140,7 +140,3 @@ MSE numbers are noisier on a single prompt (random selection has high variance p
 The tri-scorer beats uniform random at every `topk >= 64`, with the largest absolute gap at `topk = 512` (PPL 92.6 vs 154.5, a 0.60 ratio). At `topk = 32` the two are within noise of each other.
 
 But the more important observation is that **no calibration-only sparsity below 50% retention preserves model quality on this 1B MLA model**. Even with the good selector, 50% sparsity costs 21x perplexity, and 25% sparsity (`topk = 256`) blows up to 123x. The deterministic tri-scorer is a real signal — it consistently beats random — but it is not by itself sufficient to make sparse attention drop-in here. Training the Indexer (the standard DSA recipe) is likely required to recover dense quality at meaningful sparsity ratios.
-
-## Status
-
-End-to-end plumbing is verified, and the calibration-based scorer cleanly beats a random-selection baseline across all tested sparsity levels. The tri-scorer alone does not yet recover dense-quality outputs at meaningful sparsity (below roughly 50% retained context). Natural next directions: long-context runs (4k+) where sparse attention's benefit is larger, training the Indexer (DSA's original recipe, with tri-scorer as a strong initialization or distillation target), and exploring per-layer hybrids (dense in early layers, sparse in later ones).
