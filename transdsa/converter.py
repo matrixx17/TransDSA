@@ -286,6 +286,15 @@ def load_dsa_model(
             + "\n".join(f"  {k}" for k in unexpected)
         )
 
+    # Step 4: Move newly created Indexer parameters to the target device.
+    # convert_model() creates Indexer modules on CPU (PyTorch default).
+    # The checkpoint doesn't contain indexer weights (they're untrained),
+    # so load_state_dict leaves them on CPU.  Ensure the full model —
+    # including all Indexer submodules — is on the correct device.
+    device_obj = torch.device(device)
+    if device_obj.type != "cpu":
+        model = model.to(device_obj)
+
     return model
 
 
