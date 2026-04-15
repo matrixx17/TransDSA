@@ -81,7 +81,7 @@ Set `layer.self_attn.use_tri_scorer = False` on any layer to fall back to the le
 
 ```
 python tests/check.py
-python tests/test_tri_scorer.py --device mps
+python tests/test_tri_scorer.py --device mps  # if using M-Series Mac
 ```
 
 `check.py` verifies that the converter preserves MLA weights, that Indexer shapes are correct, and that the Indexer mask actually affects the output when `topk=1`. `test_tri_scorer.py` builds the scorer, attaches it to every layer, and runs a forward pass against the Indexer baseline.
