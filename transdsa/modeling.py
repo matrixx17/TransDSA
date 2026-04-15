@@ -362,17 +362,23 @@ class DSAAttention(nn.Module):
         self,
         mla: nn.Module,
         dsa_config: DSAConfig,
+        use_tri_scorer: bool = False,
     ):
         """
         Args:
-            mla        : A pretrained MLAAttention instance whose weights are reused.
-            dsa_config : Indexer hyperparameters.
+            mla            : A pretrained MLAAttention instance whose weights are reused.
+            dsa_config     : Indexer hyperparameters.
+            use_tri_scorer : If True, use TriAttentionScorer instead of the
+                             learned Indexer for token selection.  Call
+                             load_tri_scorer() after construction to load stats.
         """
         super().__init__()
 
         self.config = mla.config
         self.layer_idx = mla.layer_idx
         self.dsa_config = dsa_config
+        self.use_tri_scorer = use_tri_scorer
+        self.tri_scorer = None  # set by load_tri_scorer()
 
         # ---- Borrow dimensions from MLA ----
         self.num_heads = mla.num_heads
@@ -420,6 +426,25 @@ class DSAAttention(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    # TriAttention scorer
+    # ------------------------------------------------------------------
+
+    def load_tri_scorer(self, scorer: "tri_scorer.TriAttentionScorer") -> None:
+        """
+        Attach a pre-built TriAttentionScorer to this layer.
+
+        The scorer is shared across layers (it indexes by layer_idx
+        internally), so the same object can be passed to every
+        DSAAttention instance.
+
+        Args:
+            scorer : A TriAttentionScorer loaded via
+                     TriAttentionScorer.from_stats().
+        """
+        self.tri_scorer = scorer
+        self.use_tri_scorer = True
+
+    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
@@ -444,7 +469,7 @@ class DSAAttention(nn.Module):
         qr: Optional[torch.Tensor],
         cos: torch.Tensor,
         sin: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute full MLA Q, K, V tensors for the current (query) positions.
 
@@ -461,6 +486,7 @@ class DSAAttention(nn.Module):
             query_states : (bsz, n_heads, seq_q, qk_head_dim)
             key_states   : (bsz, n_heads, seq_q, qk_head_dim)
             value_states : (bsz, n_heads, seq_q, v_head_dim)
+            k_rot_raw    : (bsz, 1, seq_q, qk_rope_head_dim) pre-RoPE key rope component
         """
         bsz, seq_q, _ = hidden_states.shape
 
@@ -515,7 +541,7 @@ class DSAAttention(nn.Module):
         query_states = torch.cat([q_nope, q_rot], dim=-1)
         key_states   = torch.cat([k_nope, k_rot], dim=-1)
 
-        return query_states, key_states, value_states
+        return query_states, key_states, value_states, k_rot_raw
 
     # ------------------------------------------------------------------
     # Forward
@@ -561,12 +587,13 @@ class DSAAttention(nn.Module):
         # ------------------------------------------------------------------
         # 2. Full MLA Q, K, V for the current positions
         # ------------------------------------------------------------------
-        query_states, key_states, value_states = self._compute_mla_qkv(
-            hidden_states, qr, cos, sin
+        query_states, key_states, value_states, k_rot_raw = (
+            self._compute_mla_qkv(hidden_states, qr, cos, sin)
         )
         # query_states : (bsz, n_heads, seq_q, qk_head_dim)
         # key_states   : (bsz, n_heads, seq_q, qk_head_dim)
         # value_states : (bsz, n_heads, seq_q, v_head_dim)
+        # k_rot_raw    : (bsz, 1, seq_q, qk_rope_head_dim) — pre-RoPE
 
         # ------------------------------------------------------------------
         # 3. KV cache update (decode path)
@@ -585,31 +612,82 @@ class DSAAttention(nn.Module):
         seq_k = key_states.shape[2]
 
         # ------------------------------------------------------------------
-        # 4. Indexer — non-interleaved RoPE, scores current tokens only
-        #
-        # The Indexer receives x and qr for the current seq_q positions.
-        # It produces a (seq_q × seq_q) score matrix (tokens against each
-        # other in the current window).  In full-sequence training seq_q ==
-        # seq_k, so this is correct.  For autoregressive decode an external
-        # Indexer key cache would be needed; that is deferred to the inference
-        # engine.
+        # 4. Token selection — Indexer or TriAttention scorer
         # ------------------------------------------------------------------
-        # Slice attention_mask to the current-window square, if provided.
-        # attention_mask may be (bsz, 1, seq_q, seq_k); we need the last
-        # seq_q columns to match the Indexer's (seq_q × seq_q) score shape.
-        if attention_mask is not None and seq_k > seq_q:
-            indexer_mask = attention_mask[:, :, :, -seq_q:]
+        if self.use_tri_scorer and self.tri_scorer is not None:
+            # TriAttention deterministic scorer — scores ALL key positions
+            # (cached + current) using frequency-domain statistics.
+            #
+            # For prefill (no cache): k_rot_raw covers all positions.
+            # For decode (with cache): need cos/sin for all cached positions
+            # to invert RoPE on the cached keys.
+            if past_key_values is not None and seq_k > seq_q:
+                # Decode path: build full cos/sin tables for all cached
+                # positions.  The model's rotary embedder produces tables
+                # for arbitrary position ranges.
+                backbone = getattr(
+                    self, "_backbone_ref", None
+                )
+                # Use the scorer's cache-aware method
+                topk_flat = self.tri_scorer.score_tokens_with_cache(
+                    layer_idx=self.layer_idx,
+                    cached_key_states=key_states,
+                    k_rot_raw_current=k_rot_raw,
+                    cos_full=cos,
+                    sin_full=sin,
+                    cache_position=cache_position,
+                    seq_q=seq_q,
+                    topk=self.dsa_config.index_topk,
+                )
+                # topk_flat: [k_val] — indices into seq_k
+                # Expand to (bsz, seq_q, k_val) for mask construction
+                k_val = topk_flat.shape[0]
+                topk_indices = topk_flat.unsqueeze(0).unsqueeze(0).expand(
+                    bsz, seq_q, k_val,
+                )
+            else:
+                # Prefill path: all keys are current, k_rot_raw covers
+                # everything.  Score per query position.
+                # k_rot_raw: (bsz, 1, seq_q, rope_dim) — same for all heads
+                k_rot_2d = k_rot_raw[0, 0]  # (seq_q, rope_dim)
+                positions = (
+                    cache_position
+                    if cache_position is not None
+                    else torch.arange(
+                        seq_q,
+                        device=hidden_states.device,
+                        dtype=torch.long,
+                    )
+                )
+                current_pos = int(positions[-1].item())
+                topk_flat = self.tri_scorer.score_tokens(
+                    layer_idx=self.layer_idx,
+                    k_rot_raw=k_rot_2d,
+                    absolute_positions=positions,
+                    current_position=current_pos,
+                    topk=self.dsa_config.index_topk,
+                )
+                # topk_flat: [k_val]
+                k_val = topk_flat.shape[0]
+                topk_indices = topk_flat.unsqueeze(0).unsqueeze(0).expand(
+                    bsz, seq_q, k_val,
+                )
         else:
-            indexer_mask = attention_mask
+            # Learned Indexer — scores current window only
+            # Slice attention_mask to the current-window square.
+            if attention_mask is not None and seq_k > seq_q:
+                indexer_mask = attention_mask[:, :, :, -seq_q:]
+            else:
+                indexer_mask = attention_mask
 
-        topk_indices = self.indexer(
-            x=hidden_states,
-            qr=qr,
-            cos=cos,
-            sin=sin,
-            attention_mask=indexer_mask,
-        )
-        # topk_indices: (bsz, seq_q, k_val),  k_val = min(index_topk, seq_q)
+            topk_indices = self.indexer(
+                x=hidden_states,
+                qr=qr,
+                cos=cos,
+                sin=sin,
+                attention_mask=indexer_mask,
+            )
+        # topk_indices: (bsz, seq_q, k_val)
 
         # ------------------------------------------------------------------
         # 5. Raw attention scores (eager — we own the compute here)
@@ -627,23 +705,25 @@ class DSAAttention(nn.Module):
         # ------------------------------------------------------------------
         # 7. DSA index mask — zero out non-selected positions
         #
-        # topk_indices are offsets into the *current window* (0 … seq_q-1).
-        # When seq_k > seq_q (decode with cache), the selected positions must
-        # be shifted to refer to the *last seq_q* positions of the full key
-        # sequence, which is where the Indexer's keys live.
+        # topk_indices are offsets into either the current window
+        # (Indexer) or the full seq_k (TriAttention scorer).
+        # When using the Indexer and seq_k > seq_q, shift indices.
+        # When using the tri_scorer, indices already refer to seq_k.
         # ------------------------------------------------------------------
-        # Build a (bsz, seq_q, seq_k) additive mask: -inf everywhere, then
-        # scatter 0.0 at the top-k positions.
         index_mask = torch.full(
             (bsz, seq_q, seq_k),
             float("-inf"),
             device=scores.device,
             dtype=scores.dtype,
         )
-        # Shift indices if the Indexer covered only a suffix of the key seq.
-        offset = seq_k - seq_q
-        shifted_indices = topk_indices + offset  # still (bsz, seq_q, k_val)
-        index_mask.scatter_(-1, shifted_indices, 0.0)
+        if self.use_tri_scorer and self.tri_scorer is not None:
+            # Indices already refer to the full seq_k dimension
+            index_mask.scatter_(-1, topk_indices, 0.0)
+        else:
+            # Indexer indices are offsets into the current window
+            offset = seq_k - seq_q
+            shifted_indices = topk_indices + offset
+            index_mask.scatter_(-1, shifted_indices, 0.0)
 
         # Broadcast over heads: (bsz, 1, seq_q, seq_k)
         scores = scores + index_mask.unsqueeze(1)
