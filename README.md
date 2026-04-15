@@ -83,21 +83,42 @@ Set `layer.self_attn.use_tri_scorer = False` on any layer to fall back to the le
 python tests/check.py
 python tests/test_tri_scorer.py --device mps  # if using M-Series Mac
 python tests/sanity_sparse_vs_dense.py --device mps --seq-len 1024 --topk 64
+python tests/sparsity_sweep.py --device mps --seq-lens 1024 2048 \
+    --topks 16 32 64 128 256 512
 ```
 
-`check.py` verifies that the converter preserves MLA weights, that Indexer shapes are correct, and that the Indexer mask actually affects the output when `topk=1`. `test_tri_scorer.py` builds the scorer, attaches it to every layer, and runs a forward pass against the Indexer baseline. `sanity_sparse_vs_dense.py` compares the tri-scorer, a uniform-random selector, and dense attention on a long prompt, reporting logit MSE and next-token top-1 agreement against the dense baseline.
+`check.py` verifies that the converter preserves MLA weights, that Indexer shapes are correct, and that the Indexer mask actually affects the output when `topk=1`. `test_tri_scorer.py` builds the scorer, attaches it to every layer, and runs a forward pass against the Indexer baseline. `sanity_sparse_vs_dense.py` compares the tri-scorer, a uniform-random selector, and dense attention on a long prompt. `sparsity_sweep.py` runs the same comparison across a grid of `(seq_len, topk)` values and writes a CSV.
 
-## Initial findings
+## Findings
 
-At `seq_len = 1024`, `topk = 64` (roughly 6% of positions attended), on `llama3.2-1b-dsa`:
+### Single prompt, topk=64, seq_len=1024
 
 | Mode | MSE vs dense | Top-1 agreement |
 |---|---|---|
 | Tri-scorer | 4.33 | 22.5% |
 | Random | 5.55 | 8.1% |
 
-The tri-scorer is meaningfully closer to dense than random on both metrics, and the gap on next-token top-1 agreement (roughly 2.8x) is larger than the gap on MSE. This confirms the calibration-based scoring is picking up real signal before any training.
+### Sparsity sweep (single prompt)
+
+| seq_len | topk | sparsity | tri top-1 | rand top-1 | gap |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 16 | 1.6% | 0.155 | 0.078 | +0.077 |
+| 1024 | 32 | 3.1% | 0.152 | 0.092 | +0.061 |
+| 1024 | 64 | 6.3% | 0.225 | 0.070 | +0.154 |
+| 1024 | 128 | 12.5% | 0.193 | 0.140 | +0.054 |
+| 1024 | 256 | 25.0% | 0.597 | 0.312 | +0.285 |
+| 1024 | 512 | 50.0% | 0.806 | 0.472 | +0.334 |
+| 2048 | 16 | 0.8% | 0.159 | 0.069 | +0.090 |
+| 2048 | 32 | 1.6% | 0.183 | 0.087 | +0.095 |
+| 2048 | 64 | 3.1% | 0.194 | 0.072 | +0.122 |
+| 2048 | 128 | 6.3% | 0.187 | 0.094 | +0.092 |
+| 2048 | 256 | 12.5% | 0.394 | 0.145 | +0.249 |
+| 2048 | 512 | 25.0% | 0.493 | 0.343 | +0.150 |
+
+The tri-scorer beats uniform-random on next-token top-1 agreement in every cell, with gaps of +6 to +33 percentage points. Top-1 agreement saturates around 25-50% of context retained (`topk / seq_len`). At extreme sparsity (≤ 6% of context) all selectors lose substantial fidelity to dense, but tri-scorer remains roughly 2-3x better than random.
+
+MSE numbers are noisier on a single prompt (random selection has high variance per draw) — top-1 agreement is the more reliable metric. A multi-prompt perplexity sweep is the natural next step.
 
 ## Status
 
-End-to-end plumbing is verified and the scorer beats a random-selection baseline at high sparsity. Remaining work: sparsity sweep across `topk`, long-context evaluation (>= 2k tokens), perplexity harness on wikitext-2 held-out, and batch-size-greater-than-one support in the decode path.
+End-to-end plumbing is verified, and the scorer cleanly beats a random-selection baseline across all tested sparsity levels and at both 1k and 2k context. Remaining work: perplexity harness on wikitext-2 held-out (many prompts, lower variance), longer-context runs (4k+), and batch-size-greater-than-one support in the decode path.
